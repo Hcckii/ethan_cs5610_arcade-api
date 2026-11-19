@@ -2,22 +2,20 @@ import { Hono } from "hono";
 import { battleship } from "@ethanhua/arcade-core";
 import { games } from "../db.js";
 import { ObjectId } from "mongodb";
+import { checkBody, getCurrentUser } from "../sharedFunction.js";
 
 const gamesApp = new Hono();
 
-gamesApp.post("/", async (c)=>{
-    const userId = c.req.header("x-user");
-    if(!userId){
-        return c.json({error:"Not logged in"}, 401);
+gamesApp.post("/", async (c) => {
+    const userId = await getCurrentUser(c);
+    if (!userId) {
+      return c.json({ error: "Not logged in" }, 401);
     }
     const game = battleship.createGame();
-    const newGame = {
-        ...game,
-        users:{p1:userId, p2:null}
-    };
+    const newGame = { ...game, users: { p1: userId, p2: null } };
     const result = await games.insertOne(newGame);
-    return c.json({id:result.insertedId}, 201);
-})
+    return c.json({ id: result.insertedId }, 201);
+});
 
 gamesApp.post("/:id/players", async(c)=>{
     const {game, userId, error} = await loadPlayerGame(c);
@@ -80,17 +78,17 @@ function getPlayerID(game, userId) {
 }
 
 async function loadPlayerGame(c) {
+    const userId = await getCurrentUser(c);
+    if (!userId) {
+      return { error: c.json({ error: "Not logged in" }, 401) };
+    }
     const id = c.req.param("id");
     if (!ObjectId.isValid(id)) {
-        return { error: c.json({ error: "Invalid ID" }, 404) };
-    }
-    const userId = c.req.header("x-user");
-    if (!userId) {
-        return { error: c.json({ error: "Not logged in" }, 401) };
+      return { error: c.json({ error: "Game not found" }, 404) };
     }
     const game = await games.findOne({ _id: new ObjectId(id) });
     if (!game) {
-        return { error: c.json({ error: "Game not found" }, 404) };
+      return { error: c.json({ error: "Game not found" }, 404) };
     }
     return { game, userId };
 }
@@ -102,33 +100,22 @@ async function saveGame(game) {
     );
 }
 
-async function checkBody(c) {
-    try {
-      const body = await c.req.json();
-      if (body === null || typeof body !== "object") {
-        return { error: c.json({ error: "Body must be a JSON object" }, 400) };
-      }
-      return { body };
-    } catch {
-      return { error: c.json({ error: "Invalid JSON" }, 400) };
-    }
-}
 //==================== Ships =======================
-gamesApp.post("/:id/ships/random", async(c)=>{
-    const {game, userId, error} = await loadPlayerGame(c);
-    if(error){
-        return error;
+gamesApp.post("/:id/ships/random", async (c) => {
+    const { game, userId, error } = await loadPlayerGame(c);
+    if (error) {
+      return error;
     }
     const player = getPlayerID(game, userId);
-    if(!player){
-        return c.json({error:"You are not the player of this game"}, 409);
+    if (!player) {
+      return c.json({ error: "You are not the player of this game" }, 403);
     }
-    const result= battleship.randomPlacement(game, player);
-    if(result.error){
-        return c.json({error:result.error}, 400);
+    const result = battleship.randomPlacement(game, player);
+    if (result.error) {
+      return c.json({ error: result.error }, 409);
     }
     await saveGame(result.game);
-    return c.json({placed:true, view:battleship.getPlayerView(result.game, player)}, 200);
+    return c.json(battleship.getPlayerView(result.game, player), 200);
 });
 
 gamesApp.put("/:id/ships/:type", async (c)=>{

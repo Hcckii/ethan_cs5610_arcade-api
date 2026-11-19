@@ -1,7 +1,7 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import gamesApp from "./routes/games.js";
-
+import authApp from "./routes/auth.js";
 const app = new Hono();
 
 app.get("/", (c) => {
@@ -9,7 +9,7 @@ app.get("/", (c) => {
 });
 
 app.route("/games", gamesApp);
-
+app.route("/auth", authApp);
 // app.get("/test-core", (c) => {
 //   return c.json(battleship.createGame(), 200);
 // });
