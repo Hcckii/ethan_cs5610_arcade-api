@@ -39,6 +39,24 @@ gamesApp.post("/:id/players", async(c)=>{
     return c.json(p2Game, 201);
 });
 
+gamesApp.post("/:id/players/me", async (c)=>{
+    const {game, userId, error} = await loadPlayerGame(c);
+    if(error){
+        return error;
+    }
+    const player = getPlayerID(game, userId);
+    if(!player){
+        return c.json({error:"You are not the player of this game"}, 403);
+    }
+    const result = battleship.confirmReady(game, player);
+    if(result.error){
+        return c.json({error:result.error}, 409);
+    }
+    await saveGame(result.game);
+    return c.json(battleship.getPlayerView(result.game, player), 200);
+});
+
+
 gamesApp.get("/:id", async (c) => {
     const { game, userId, error } = await loadPlayerGame(c);
     if (error) {
@@ -74,7 +92,7 @@ async function loadPlayerGame(c) {
     if (!game) {
         return { error: c.json({ error: "Game not found" }, 404) };
     }
-    return { userId, game };
+    return { game, userId };
 }
 
 async function saveGame(game) {
@@ -83,7 +101,35 @@ async function saveGame(game) {
       { $set: { phase: game.phase, turn: game.turn, winner: game.winner, players: game.players } }
     );
 }
+
+async function checkBody(c) {
+    try {
+      const body = await c.req.json();
+      if (body === null || typeof body !== "object") {
+        return { error: c.json({ error: "Body must be a JSON object" }, 400) };
+      }
+      return { body };
+    } catch {
+      return { error: c.json({ error: "Invalid JSON" }, 400) };
+    }
+}
 //==================== Ships =======================
+gamesApp.post("/:id/ships/random", async(c)=>{
+    const {game, userId, error} = await loadPlayerGame(c);
+    if(error){
+        return error;
+    }
+    const player = getPlayerID(game, userId);
+    if(!player){
+        return c.json({error:"You are not the player of this game"}, 409);
+    }
+    const result= battleship.randomPlacement(game, player);
+    if(result.error){
+        return c.json({error:result.error}, 400);
+    }
+    await saveGame(result.game);
+    return c.json({placed:true, view:battleship.getPlayerView(result.game, player)}, 200);
+});
 
 gamesApp.put("/:id/ships/:type", async (c)=>{
     const {game, userId, error} = await loadPlayerGame(c);
@@ -94,20 +140,49 @@ gamesApp.put("/:id/ships/:type", async (c)=>{
     if(!player){
         return c.json({error:"You are not the player of this game"}, 403);
     }
-    let body;
-    try{
-        body = await c.req.json();
-    }catch{
-        return c.json({error:"Invalid JSON"}, 400);
+    const {body, error:bderror} = await checkBody(c);
+    if(bderror){
+        return bderror;
     }
     const ship = {...body, "type":c.req.param("type")};
-    const result = battleship.placeShip(ship, game.players[player].ships);
+    const result = battleship.placeShip(game, player, ship);
     if(result.error){
         const status = result.error==="Invalid ship"?400:409;
-        return c.json(result.error, status);
+        return c.json({error:result.error}, status);
     }
     await saveGame(result.game);
     return c.json({placed:result.placed, view:battleship.getPlayerView(result.game, player)}, 200);
+});
+
+gamesApp.post("/:id/shots", async(c)=>{
+    const {game, userId, error:loadError} = await loadPlayerGame(c);
+    if(loadError){
+        return loadError;
+    }
+    const player = getPlayerID(game, userId);
+    if(!player){
+        return c.json({error:"You are not the player of this game"}, 403);
+    }
+    const {body, error:bdError} = await checkBody(c);
+    if(bdError){
+        return bdError;
+    }
+    const {row, col} = body;
+    const coord = [row, col];
+    const result = battleship.fire(game, player, coord);
+    if (result.error) {
+        const status = result.error === "Invalid coord" ? 400 : 409;
+        return c.json({ error: result.error }, status);
+    }
+    await saveGame(result.game);
+    return c.json(
+        {
+            hit:result.hit,
+            sunk:result.sunk,
+            ship:result.hit?battleship.allShips[result.shipID-1]:null,
+            view:battleship.getPlayerView(result.game, player)
+        }
+        , 201);
 });
 
 export default gamesApp;
