@@ -12,7 +12,7 @@ gamesApp.post("/", async (c) => {
       return c.json({ error: "Not logged in" }, 401);
     }
     const game = battleship.createGame();
-    const newGame = { ...game, users: { p1: userId, p2: null } };
+    const newGame = { ...game, users: { p1: userId, p2: null }, createdAt: new Date() };
     const result = await games.insertOne(newGame);
     return c.json({ id: result.insertedId }, 201);
 });
@@ -53,7 +53,28 @@ gamesApp.post("/:id/players/me", async (c)=>{
     await saveGame(result.game);
     return c.json(battleship.getPlayerView(result.game, player), 200);
 });
-
+gamesApp.get("/", async (c) => {
+    const userId = await getCurrentUser(c);
+    if (!userId) {
+      return c.json({ error: "Not logged in" }, 401);
+    }
+  
+    let filter;
+    if (c.req.query("open") === "true") {
+      filter = { "users.p2": null, "users.p1": { $ne: userId } };
+    } else {
+      filter = { $or: [{ "users.p1": userId }, { "users.p2": userId }] };
+    }
+  
+    const list = await games
+      .find(filter, { projection: { phase: 1, createdAt: 1 } })
+      .sort({ createdAt: -1 })
+      .limit(20)
+      .toArray();
+  
+    const result = list.map((g) => ({ id: g._id, phase: g.phase, createdAt: g.createdAt }));
+    return c.json(result, 200);
+  });
 
 gamesApp.get("/:id", async (c) => {
     const { game, userId, error } = await loadPlayerGame(c);
