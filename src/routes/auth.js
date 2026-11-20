@@ -1,9 +1,10 @@
 import { Hono } from "hono";
 import { randomBytes } from "node:crypto";
-import { setCookie } from "hono/cookie";
+import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { users, sessions } from "../db.js";
+import { ObjectId } from "mongodb";
 import bcrypt from "bcryptjs";
-import { checkBody, checkAccount } from "../sharedFunction.js";
+import { checkBody, checkAccount, getCurrentUser } from "../sharedFunction.js";
 
 const SESSION_MS = 7 * 24 * 60 * 60 * 1000;
 const authApp = new Hono();
@@ -66,4 +67,24 @@ authApp.post("/login", async (c)=>{
     return c.json({userId:user._id.toString(), email}, 200);
 })
 
+authApp.post("/logout", async (c)=>{
+    const token = getCookie(c, "session");
+    if(token){
+        await sessions.deleteOne({token});
+    }
+    deleteCookie(c, "session", {path:"/"});
+    return c.json({message:"You have logged out"}, 200);
+});
+
+authApp.get("/me", async (c) => {
+    const userId = await getCurrentUser(c);
+    if (!userId) {
+      return c.json({ error: "You have not logged in" }, 401);
+    }
+    const user = await users.findOne({ _id: new ObjectId(userId) });
+    if (!user) {
+      return c.json({ error: "You have not logged in" }, 401);
+    }
+    return c.json({ id: user._id, email: user.email }, 200);
+});
 export default authApp;
