@@ -1,196 +1,331 @@
 import { Hono } from "hono";
+import { ObjectId } from "mongodb";
 import { battleship } from "@ethanhua/arcade-core";
 import { games } from "../db.js";
-import { ObjectId } from "mongodb";
-import { checkBody, getCurrentUser } from "../sharedFunction.js";
+import { checkBody, checkOptionalBody, getCurrentUser } from "../sharedFunction.js";
+import { AI_PLAYER, isAiPlayer, createAiQueue, nextAiShot } from "../ai.js";
 
 const gamesApp = new Hono();
 
-gamesApp.post("/", async (c) => {
-    const userId = await getCurrentUser(c);
-    if (!userId) {
-      return c.json({ error: "Not logged in" }, 401);
-    }
-    const game = battleship.createGame();
-    const newGame = { ...game, users: { p1: userId, p2: null }, createdAt: new Date() };
-    const result = await games.insertOne(newGame);
-    return c.json({ id: result.insertedId }, 201);
-});
+//==================== Helpers ====================
 
-gamesApp.post("/:id/players", async(c)=>{
-    const {game, userId, error} = await loadPlayerGame(c);
-    if(error){
-        return error;
-    }
-    if(game.users.p1===userId){
-        return c.json({error:"You cannot join your own game"}, 409);
-    }
-    if (game.users.p2 !== null) {
-        return c.json({ error: "The game is full" }, 409);
-    }
-    const result = await games.updateOne({_id:game._id, "users.p2":null}, {$set:{"users.p2":userId}});
-    if(result.matchedCount===0){
-        return c.json({error:"The game is full"}, 409);
-    }
-    const updated = {...game, users:{...game.users, p2:userId}};
-    const p2Game = battleship.getPlayerView(updated, "p2");
-    return c.json(p2Game, 201);
-});
+// A game document in MongoDB:
+// {
+//   status: "waiting" | "playing" | "finished",
+//   players: { p1: { id, email }, p2: { id, email } | null },
+//   boards: { p1: board, p2: board },   // each player's own fleet, with the opponent's shots on it
+//   turn: "p1" | "p2",
+//   winner: null | "p1" | "p2",
+//   moves: number,                      // goes up by one on every shot, used to reject stale writes
+//   aiQueue: [[x, y], ...]              // only in games against the AI: the squares it will fire at next
+//   createdAt, updatedAt
+// }
 
-gamesApp.post("/:id/players/me", async (c)=>{
-    const {game, userId, error} = await loadPlayerGame(c);
-    if(error){
-        return error;
-    }
-    const player = getPlayerID(game, userId);
-    if(!player){
-        return c.json({error:"You are not the player of this game"}, 403);
-    }
-    const result = battleship.confirmReady(game, player);
-    if(result.error){
-        return c.json({error:result.error}, 409);
-    }
-    await saveGame(result.game);
-    return c.json(battleship.getPlayerView(result.game, player), 200);
-});
-gamesApp.get("/", async (c) => {
-    const userId = await getCurrentUser(c);
-    if (!userId) {
-      return c.json({ error: "Not logged in" }, 401);
-    }
-  
-    let filter;
-    if (c.req.query("open") === "true") {
-      filter = { "users.p2": null, "users.p1": { $ne: userId } };
-    } else {
-      filter = { $or: [{ "users.p1": userId }, { "users.p2": userId }] };
-    }
-  
-    const list = await games
-      .find(filter, { projection: { phase: 1, createdAt: 1 } })
-      .sort({ createdAt: -1 })
-      .limit(20)
-      .toArray();
-  
-    const result = list.map((g) => ({ id: g._id, phase: g.phase, createdAt: g.createdAt }));
-    return c.json(result, 200);
-  });
-
-gamesApp.get("/:id", async (c) => {
-    const { game, userId, error } = await loadPlayerGame(c);
-    if (error) {
-      return error;
-    }
-    const player = getPlayerID(game, userId);
-    if (player === null) {
-      return c.json({ error: "You are not the player of this game" }, 403);
-    }
-    return c.json(battleship.getPlayerView(game, player), 200);
-});
+function otherPlayer(player) {
+    return player === "p1" ? "p2" : "p1";
+}
 
 function getPlayerID(game, userId) {
-    if (game.users.p1 === userId) {
+    if (game.players.p1.id === userId) {
         return "p1";
     }
-    if (game.users.p2 === userId) {
+    if (game.players.p2 !== null && game.players.p2.id === userId) {
         return "p2";
     }
     return null;
 }
 
-async function loadPlayerGame(c) {
-    const userId = await getCurrentUser(c);
-    if (!userId) {
-      return { error: c.json({ error: "Not logged in" }, 401) };
-    }
+// Load the game from the :id in the path. Returns { game } or { error } with a 404 response.
+async function loadGame(c) {
     const id = c.req.param("id");
     if (!ObjectId.isValid(id)) {
-      return { error: c.json({ error: "Game not found" }, 404) };
+        return { error: c.json({ error: "Game not found" }, 404) };
     }
     const game = await games.findOne({ _id: new ObjectId(id) });
     if (!game) {
-      return { error: c.json({ error: "Game not found" }, 404) };
+        return { error: c.json({ error: "Game not found" }, 404) };
     }
-    return { game, userId };
+    return { game };
 }
 
-async function saveGame(game) {
-    await games.updateOne(
-      { _id: game._id },
-      { $set: { phase: game.phase, turn: game.turn, winner: game.winner, players: game.players } }
-    );
+function playerEmails(game) {
+    return {
+        p1: game.players.p1.email,
+        p2: game.players.p2 === null ? null : game.players.p2.email,
+    };
 }
 
-//==================== Ships =======================
-gamesApp.post("/:id/ships/random", async (c) => {
-    const { game, userId, error } = await loadPlayerGame(c);
-    if (error) {
-      return error;
+// A short summary for the game list. Never includes boards.
+function toListItem(game) {
+    return {
+        id: game._id.toString(),
+        status: game.status,
+        players: playerEmails(game),
+        vsAi: isAiPlayer(game.players.p2),
+        turn: game.turn,
+        winner: game.winner,
+        createdAt: game.createdAt,
+    };
+}
+
+// One game as one viewer is allowed to see it.
+// viewer is "p1" or "p2" for a player, or null for a spectator of a finished game.
+function toGameView(game, viewer) {
+    const base = {
+        id: game._id.toString(),
+        status: game.status,
+        players: playerEmails(game),
+        vsAi: isAiPlayer(game.players.p2),
+        turn: game.turn,
+        winner: game.winner,
+        you: viewer,
+    };
+
+    if (viewer === null) {
+        // The game is over, so nothing is hidden anymore
+        return {
+            ...base,
+            boards: { p1: game.boards.p1, p2: game.boards.p2 },
+            sunk: { p1: battleship.getSunkShips(game.boards.p1), p2: battleship.getSunkShips(game.boards.p2) },
+        };
     }
-    const player = getPlayerID(game, userId);
-    if (!player) {
-      return c.json({ error: "You are not the player of this game" }, 403);
+
+    const enemy = otherPlayer(viewer);
+    return {
+        ...base,
+        myBoard: game.boards[viewer],
+        // The opponent's ships are left out, except the ones that are already sunk
+        opponentBoard: battleship.hideShips(game.boards[enemy]),
+        mySunk: battleship.getSunkShips(game.boards[viewer]),
+        opponentSunk: battleship.getSunkShips(game.boards[enemy]),
+    };
+}
+
+//==================== GET /api/games ====================
+// The games waiting for a second player, and the games the user is playing in
+
+gamesApp.get("/", async (c) => {
+    const user = await getCurrentUser(c);
+    if (!user) {
+        return c.json({ error: "Not logged in" }, 401);
     }
-    const result = battleship.randomPlacement(game, player);
-    if (result.error) {
-      return c.json({ error: result.error }, 409);
-    }
-    await saveGame(result.game);
-    return c.json(battleship.getPlayerView(result.game, player), 200);
+
+    // Leave the boards out at the database level
+    const options = { projection: { status: 1, players: 1, turn: 1, winner: 1, createdAt: 1 } }; // no boards, no aiQueue
+
+    const [waiting, mine] = await Promise.all([
+        games
+            .find({ status: "waiting", "players.p1.id": { $ne: user.id } }, options)
+            .sort({ createdAt: -1 })
+            .limit(20)
+            .toArray(),
+        games
+            .find({ $or: [{ "players.p1.id": user.id }, { "players.p2.id": user.id }] }, options)
+            .sort({ createdAt: -1 })
+            .limit(20)
+            .toArray(),
+    ]);
+
+    return c.json({ waiting: waiting.map(toListItem), mine: mine.map(toListItem) }, 200);
 });
 
-gamesApp.put("/:id/ships/:type", async (c)=>{
-    const {game, userId, error} = await loadPlayerGame(c);
-    if(error){
+//==================== POST /api/games ====================
+// Create a new game, with both fleets placed randomly
+
+gamesApp.post("/", async (c) => {
+    const user = await getCurrentUser(c);
+    if (!user) {
+        return c.json({ error: "Not logged in" }, 401);
+    }
+
+    const now = new Date();
+    const game = {
+        status: "waiting",
+        players: { p1: { id: user.id, email: user.email }, p2: null },
+        boards: { p1: battleship.createRandomBoard(), p2: battleship.createRandomBoard() },
+        turn: "p1",
+        winner: null,
+        moves: 0,
+        createdAt: now,
+        updatedAt: now,
+    };
+
+    // insertOne adds the new _id to the game object
+    await games.insertOne(game);
+    return c.json(toGameView(game, "p1"), 201);
+});
+
+//==================== GET /api/games/:id ====================
+// One game, with the opponent's ships left out.
+// Logged-out visitors and non-players can only see a game after it is over.
+
+gamesApp.get("/:id", async (c) => {
+    const { game, error } = await loadGame(c);
+    if (error) {
         return error;
     }
-    const player = getPlayerID(game, userId);
-    if(!player){
-        return c.json({error:"You are not the player of this game"}, 403);
+
+    const user = await getCurrentUser(c);
+    if (!user) {
+        if (game.status === "finished") {
+            return c.json(toGameView(game, null), 200);
+        }
+        return c.json({ error: "Log in to view a game that is not over yet" }, 401);
     }
-    const {body, error:bderror} = await checkBody(c);
-    if(bderror){
-        return bderror;
+
+    const player = getPlayerID(game, user.id);
+    if (player !== null) {
+        return c.json(toGameView(game, player), 200);
     }
-    const ship = {...body, "type":c.req.param("type")};
-    const result = battleship.placeShip(game, player, ship);
-    if(result.error){
-        const status = result.error==="Invalid ship"?400:409;
-        return c.json({error:result.error}, status);
+    if (game.status === "finished") {
+        return c.json(toGameView(game, null), 200);
     }
-    await saveGame(result.game);
-    return c.json({placed:result.placed, view:battleship.getPlayerView(result.game, player)}, 200);
+    return c.json({ error: "You are not a player in this game" }, 403);
 });
 
-gamesApp.post("/:id/shots", async(c)=>{
-    const {game, userId, error:loadError} = await loadPlayerGame(c);
-    if(loadError){
-        return loadError;
+//==================== POST /api/games/:id/players ====================
+// Join a waiting game as the second player.
+// Body (optional): { "ai": true } lets the game's creator make the AI the second player instead.
+
+gamesApp.post("/:id/players", async (c) => {
+    const user = await getCurrentUser(c);
+    if (!user) {
+        return c.json({ error: "Not logged in" }, 401);
     }
-    const player = getPlayerID(game, userId);
-    if(!player){
-        return c.json({error:"You are not the player of this game"}, 403);
+    const { game, error } = await loadGame(c);
+    if (error) {
+        return error;
     }
-    const {body, error:bdError} = await checkBody(c);
-    if(bdError){
-        return bdError;
+    const { body, error: bodyError } = await checkOptionalBody(c);
+    if (bodyError) {
+        return bodyError;
     }
-    const {row, col} = body;
-    const coord = [row, col];
-    const result = battleship.fire(game, player, coord);
-    if (result.error) {
-        const status = result.error === "Invalid coord" ? 400 : 409;
-        return c.json({ error: result.error }, status);
+    if (body.ai !== undefined && typeof body.ai !== "boolean") {
+        return c.json({ error: "ai must be true or false" }, 400);
     }
-    await saveGame(result.game);
-    return c.json(
-        {
-            hit:result.hit,
-            sunk:result.sunk,
-            ship:result.hit?battleship.allShips[result.shipID-1]:null,
-            view:battleship.getPlayerView(result.game, player)
-        }
-        , 201);
+    const withAi = body.ai === true;
+
+    if (withAi && game.players.p1.id !== user.id) {
+        return c.json({ error: "Only the player who created this game can challenge the AI" }, 403);
+    }
+    if (!withAi && game.players.p1.id === user.id) {
+        return c.json({ error: "You cannot join your own game" }, 409);
+    }
+    if (game.status !== "waiting" || game.players.p2 !== null) {
+        return c.json({ error: "This game is not waiting for a player" }, 409);
+    }
+
+    const p2 = withAi ? AI_PLAYER : { id: user.id, email: user.email };
+    const changes = { "players.p2": p2, status: "playing", updatedAt: new Date() };
+    if (withAi) {
+        changes.aiQueue = createAiQueue();
+    }
+
+    // The "players.p2": null condition makes sure two people can't join at the same time
+    const result = await games.updateOne(
+        { _id: game._id, status: "waiting", "players.p2": null },
+        { $set: changes }
+    );
+    if (result.matchedCount === 0) {
+        return c.json({ error: "This game is not waiting for a player" }, 409);
+    }
+
+    const updated = { ...game, status: "playing", players: { ...game.players, p2 } };
+    return c.json(toGameView(updated, withAi ? "p1" : "p2"), 201);
 });
+
+//==================== POST /api/games/:id/shots ====================
+// Fire at a square on the opponent's board. Body: { x, y }
+
+gamesApp.post("/:id/shots", async (c) => {
+    const user = await getCurrentUser(c);
+    if (!user) {
+        return c.json({ error: "Not logged in" }, 401);
+    }
+    const { game, error } = await loadGame(c);
+    if (error) {
+        return error;
+    }
+    const player = getPlayerID(game, user.id);
+    if (player === null) {
+        return c.json({ error: "You are not a player in this game" }, 403);
+    }
+
+    const { body, error: bodyError } = await checkBody(c);
+    if (bodyError) {
+        return bodyError;
+    }
+    const { x, y } = body;
+    if (!battleship.isInBounds(x, y)) {
+        return c.json({ error: "x and y must be integers from 0 to 9" }, 400);
+    }
+
+    if (game.status === "waiting") {
+        return c.json({ error: "Waiting for a second player" }, 409);
+    }
+    if (game.status === "finished") {
+        return c.json({ error: "The game is over" }, 409);
+    }
+    if (game.turn !== player) {
+        return c.json({ error: "It is not your turn" }, 409);
+    }
+
+    const enemy = otherPlayer(player);
+    // x and y are already known to be in bounds, so an invalid shot here means a repeat
+    if (!battleship.isValidShot(game.boards[enemy], x, y)) {
+        return c.json({ error: "You already fired at that square" }, 409);
+    }
+
+    const shot = applyShot(game.boards[enemy], x, y);
+    const boards = { ...game.boards, [enemy]: shot.board };
+    let status = shot.over ? "finished" : "playing";
+    let turn = shot.over ? player : enemy;
+    let winner = shot.over ? player : null;
+    const changes = { [`boards.${enemy}`]: shot.board };
+
+    // Against the AI, it fires back right away in the same request.
+    // The human is always p1 in an AI game, so the AI fires at boards.p1.
+    let aiShot = null;
+    if (!shot.over && isAiPlayer(game.players.p2)) {
+        const next = nextAiShot(boards.p1, game.aiQueue);
+        if (next !== null) {
+            const reply = applyShot(boards.p1, next.x, next.y);
+            boards.p1 = reply.board;
+            changes["boards.p1"] = reply.board;
+            changes.aiQueue = next.queue;
+            aiShot = { x: next.x, y: next.y, hit: reply.hit, sunk: reply.sunk };
+            status = reply.over ? "finished" : "playing";
+            turn = "p1";
+            winner = reply.over ? "p2" : null;
+        }
+    }
+
+    Object.assign(changes, { status, turn, winner, updatedAt: new Date() });
+
+    // Only write if nobody else changed the game since we read it (for example, a double click)
+    const result = await games.updateOne({ _id: game._id, moves: game.moves }, { $set: changes, $inc: { moves: 1 } });
+    if (result.matchedCount === 0) {
+        return c.json({ error: "The game changed. Refresh and try again" }, 409);
+    }
+
+    const updated = { ...game, boards, status, turn, winner, moves: game.moves + 1 };
+    return c.json(
+        { hit: shot.hit, sunk: shot.sunk, gameOver: status === "finished", aiShot, game: toGameView(updated, player) },
+        201
+    );
+});
+
+// Record a shot that is already known to be valid. Returns the new board and what happened.
+function applyShot(board, x, y) {
+    const newBoard = battleship.updateBoard(board, x, y);
+    const cell = newBoard[y][x];
+    const hit = cell.shot === "hit";
+    return {
+        board: newBoard,
+        hit,
+        sunk: hit && battleship.isShipSunk(newBoard, cell.ship) ? cell.ship : null,
+        over: battleship.isGameComplete(newBoard),
+    };
+}
 
 export default gamesApp;

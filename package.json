@@ -1,6 +1,6 @@
 {
   "dependencies": {
-    "@ethanhua/arcade-core": "^1.2.3",
+    "@ethanhua/arcade-core": "^2.0.0",
     "@hono/node-server": "^2.1.9",
     "bcryptjs": "^3.0.3",
     "hono": "^4.13.19",
