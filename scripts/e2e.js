@@ -73,6 +73,12 @@ function leaksShips(view) {
     return view.opponentBoard.flat().some((cell) => cell.ship !== null && !view.opponentSunk.includes(cell.ship));
 }
 
+// Confirm the fleet the server placed randomly
+async function confirmFleet(token, gameId) {
+    const view = await request("GET", `/games/${gameId}`, { token });
+    return request("POST", `/games/${gameId}/ships`, { token, body: { ships: view.data.myFleet } });
+}
+
 //==================== Accounts ====================
 
 const ethan = await createUser("ethan");
@@ -107,6 +113,13 @@ const id = created.data.id;
 check("the new game already has ethan's fleet placed", created.data.myBoard.flat().filter((c) => c.ship !== null).length === 17);
 check("the new game does not leak the other fleet", !leaksShips(created.data));
 
+const secondGame = await request("POST", "/games", { token: ethan });
+check("a user can be in a second game (201)", secondGame.status === 201);
+const thirdGame = await request("POST", "/games", { token: ethan });
+check("a user cannot be in a third active game (409)", thirdGame.status === 409);
+const freeSlot = await request("DELETE", `/games/${secondGame.data.id}/players/me`, { token: ethan });
+check("leaving a waiting game frees a slot (200)", freeSlot.status === 200 && freeSlot.data.deleted === true);
+
 const listForAmy = await request("GET", "/games", { token: amy });
 check("amy sees the game in waiting (200)", listForAmy.status === 200 && listForAmy.data.waiting.some((g) => g.id === id));
 check("the game list has no boards", !JSON.stringify(listForAmy.data).includes("boards"));
@@ -121,7 +134,7 @@ const selfJoin = await request("POST", `/games/${id}/players`, { token: ethan })
 check("ethan cannot join his own game (409)", selfJoin.status === 409);
 
 const join = await request("POST", `/games/${id}/players`, { token: amy });
-check("amy joins as p2 (201)", join.status === 201 && join.data.you === "p2" && join.data.status === "playing");
+check("amy joins as p2 (201)", join.status === 201 && join.data.you === "p2" && join.data.status === "placing");
 
 const bobJoin = await request("POST", `/games/${id}/players`, { token: bob });
 check("bob cannot join a full game (409)", bobJoin.status === 409);
@@ -137,6 +150,61 @@ check("invalid game id returns 404", notFound.status === 404);
 
 const unknownPath = await request("GET", "/nothing-here");
 check("unknown path returns 404 JSON", unknownPath.status === 404 && typeof unknownPath.data.error === "string");
+
+//==================== Placing ships (extra credit) ====================
+
+const placingShot = await request("POST", `/games/${id}/shots`, { token: ethan, body: { x: 0, y: 0 } });
+check("cannot fire while ships are being placed (409)", placingShot.status === 409);
+
+const customFleet = [
+    { name: "carrier", x: 0, y: 0, direction: "horizontal" },
+    { name: "battleship", x: 0, y: 2, direction: "horizontal" },
+    { name: "cruiser", x: 0, y: 4, direction: "horizontal" },
+    { name: "submarine", x: 0, y: 6, direction: "horizontal" },
+    { name: "destroyer", x: 9, y: 0, direction: "vertical" },
+];
+
+const overlap = await request("POST", `/games/${id}/ships`, {
+    token: ethan,
+    body: { ships: customFleet.map((ship) => (ship.name === "battleship" ? { ...ship, y: 0, x: 3 } : ship)) },
+});
+check("overlapping ships are rejected (400)", overlap.status === 400);
+
+const offBoard = await request("POST", `/games/${id}/ships`, {
+    token: ethan,
+    body: { ships: customFleet.map((ship) => (ship.name === "carrier" ? { ...ship, x: 7 } : ship)) },
+});
+check("a ship off the board is rejected (400)", offBoard.status === 400);
+
+const missing = await request("POST", `/games/${id}/ships`, { token: ethan, body: { ships: customFleet.slice(0, 4) } });
+check("a fleet with a missing ship is rejected (400)", missing.status === 400);
+
+const duplicate = await request("POST", `/games/${id}/ships`, {
+    token: ethan,
+    body: { ships: [...customFleet.slice(0, 4), { ...customFleet[0], y: 8 }] },
+});
+check("a fleet with a duplicate ship is rejected (400)", duplicate.status === 400);
+
+const placed = await request("POST", `/games/${id}/ships`, { token: ethan, body: { ships: customFleet } });
+check(
+    "ethan places his own fleet (201)",
+    placed.status === 201 &&
+        placed.data.ready.you === true &&
+        placed.data.myBoard[0].slice(0, 5).every((cell) => cell.ship === "carrier") &&
+        placed.data.myBoard[1][9].ship === "destroyer"
+);
+
+const placeAgain = await request("POST", `/games/${id}/ships`, { token: ethan, body: { ships: customFleet } });
+check("cannot place ships twice (409)", placeAgain.status === 409);
+
+const bobPlaces = await request("POST", `/games/${id}/ships`, { token: bob, body: { ships: customFleet } });
+check("a non-player cannot place ships (403)", bobPlaces.status === 403);
+
+const amyReady = await confirmFleet(amy, id);
+check("amy keeps her random fleet and the game starts (201)", amyReady.status === 201 && amyReady.data.status === "playing");
+
+const lateMove = await request("POST", `/games/${id}/ships`, { token: amy, body: { ships: customFleet } });
+check("cannot move ships after the game has started (409)", lateMove.status === 409);
 
 //==================== Shots ====================
 
@@ -239,7 +307,9 @@ const badAiBody = await request("POST", `/games/${aiId}/players`, { token: amy, 
 check("ai must be a boolean (400)", badAiBody.status === 400);
 
 const challenge = await request("POST", `/games/${aiId}/players`, { token: amy, body: { ai: true } });
-check("amy challenges the AI (201)", challenge.status === 201 && challenge.data.vsAi === true && challenge.data.status === "playing");
+check("amy challenges the AI (201)", challenge.status === 201 && challenge.data.vsAi === true && challenge.data.status === "placing");
+const amyAiReady = await confirmFleet(amy, aiId);
+check("the AI game starts once amy confirms her fleet", amyAiReady.status === 201 && amyAiReady.data.status === "playing");
 
 const bobJoinsAi = await request("POST", `/games/${aiId}/players`, { token: bob });
 check("nobody can join a game against the AI (409)", bobJoinsAi.status === 409);
@@ -282,6 +352,58 @@ check("the AI game finishes", aiStatus === "finished");
 check("the AI never fires at the same square twice", amyShotsTaken === aiReplies);
 check("the AI game response does not include the AI's queue", !JSON.stringify(lastView).includes("aiQueue"));
 console.log(`  AI game: winner ${lastView.winner === "p1" ? "amy" : "AI"} after ${aiShots} of amy's shots`);
+
+const myGames = await request("GET", "/games", { token: amy });
+check("a finished game stays in the list", myGames.status === 200 && myGames.data.mine.some((g) => g.id === id && g.status === "finished"));
+
+//==================== Leaving games and the active game limit ====================
+
+const gameA = await request("POST", "/games", { token: ethan });
+check("after a game finishes, the player has a free slot again (201)", gameA.status === 201);
+const idA = gameA.data.id;
+
+const bobLeaves = await request("DELETE", `/games/${idA}/players/me`, { token: bob });
+check("a non-player cannot leave a game (403)", bobLeaves.status === 403);
+
+const leaveA = await request("DELETE", `/games/${idA}/players/me`, { token: ethan });
+check("leaving a waiting game deletes it (200)", leaveA.status === 200 && leaveA.data.deleted === true);
+const goneA = await request("GET", `/games/${idA}`, { token: ethan });
+check("the deleted game is gone (404)", goneA.status === 404);
+
+const gameB = await request("POST", "/games", { token: ethan });
+const idB = gameB.data.id;
+await request("POST", `/games/${idB}/players`, { token: bob });
+const forfeit = await request("DELETE", `/games/${idB}/players/me`, { token: bob });
+check(
+    "leaving a game in progress forfeits it (200)",
+    forfeit.status === 200 &&
+        forfeit.data.game.status === "finished" &&
+        forfeit.data.game.winner === "p1" &&
+        forfeit.data.game.forfeitedBy === "p2"
+);
+const leaveFinished = await request("DELETE", `/games/${idB}/players/me`, { token: ethan });
+check("cannot leave a game that is already over (409)", leaveFinished.status === 409);
+const ethanList = await request("GET", "/games", { token: ethan });
+check("the forfeited game stays in the list as finished", ethanList.data.mine.some((g) => g.id === idB && g.status === "finished"));
+
+// bob fills both of his slots
+const bobC = await request("POST", "/games", { token: bob });
+const bobD = await request("POST", "/games", { token: bob });
+check("bob creates two games (201, 201)", bobC.status === 201 && bobD.status === 201);
+const bobE = await request("POST", "/games", { token: bob });
+check("bob cannot create a third (409)", bobE.status === 409);
+
+const gameF = await request("POST", "/games", { token: ethan });
+const bobJoinFull = await request("POST", `/games/${gameF.data.id}/players`, { token: bob });
+check("bob cannot join another game while he has two (409)", bobJoinFull.status === 409);
+
+await request("DELETE", `/games/${bobC.data.id}/players/me`, { token: bob });
+const bobJoinNow = await request("POST", `/games/${gameF.data.id}/players`, { token: bob });
+check("after leaving one, bob can join (201)", bobJoinNow.status === 201);
+
+const ethanChallenges = await request("POST", "/games", { token: ethan });
+const aiNoSlot = await request("POST", `/games/${ethanChallenges.data.id}/players`, { token: ethan, body: { ai: true } });
+check("challenging the AI does not use another slot (201)", aiNoSlot.status === 201);
 
 //==================== Logout ====================
 
